@@ -16,13 +16,22 @@ BEGIN {
     
     # Initialize system
     clear_program()
-    running = 1
     
-    while (running) {
+    # Main REPL loop
+    while (1) {
         printf "* "
-        if ((getline input) <= 0) break
+        fflush()
+        
+        if ((getline input < "/dev/stdin") <= 0) {
+            print "\nGoodbye!"
+            break
+        }
+        
         process_input(input)
     }
+    
+    close("/dev/stdin")
+    exit 0
 }
 
 function clear_program() {
@@ -60,22 +69,26 @@ function process_input(input) {
         return
     }
     if (upper_input == "QUIT" || upper_input == "EXIT") {
-        running = 0
-        return
+        print "Goodbye!"
+        exit 0
     }
     
     # Check if it's a line number (starts with alphanumeric label)
     if (match(input, /^[A-Za-z][0-9]*:/)) {
         # Extract label and command
-        label = substr(input, 1, RSTART + RLENGTH - 2)
-        command = substr(input, RSTART + RLENGTH)
+        colon_pos = index(input, ":")
+        label = toupper(substr(input, 1, colon_pos - 1))
+        command = substr(input, colon_pos + 1)
         gsub(/^[ \t]+/, "", command)  # trim leading whitespace
         
         if (command == "") {
             # Delete line if no command
-            delete program[label]
-            program_size--
-            if (program_size < 0) program_size = 0
+            if (label in program) {
+                delete program[label]
+                program_size--
+                if (program_size < 0) program_size = 0
+                print "Line " label " deleted."
+            }
         } else {
             # Add or replace line
             if (!(label in program)) program_size++
@@ -129,8 +142,13 @@ function execute_statement(stmt) {
     upper_stmt = toupper(stmt)
     
     # PRINT statement
-    if (match(upper_stmt, /^PRINT[ \t]/)) {
-        return exec_print(substr(stmt, 7))
+    if (match(upper_stmt, /^PRINT[ \t]/) || match(upper_stmt, /^PRINT$/)) {
+        if (match(upper_stmt, /^PRINT$/)) {
+            print ""
+        } else {
+            exec_print(substr(stmt, 7))
+        }
+        return 1
     }
     
     # SET statement (MK/L style: SET X TO value)
@@ -154,7 +172,7 @@ function execute_statement(stmt) {
     }
     
     # REM statement (comment)
-    if (match(upper_stmt, /^REM[ \t]/) || match(upper_stmt, /^"/)) {
+    if (match(upper_stmt, /^REM[ \t]/) || substr(stmt, 1, 1) == "\"") {
         return 1  # Comments do nothing
     }
     
@@ -186,14 +204,16 @@ function exec_print(args) {
     
     # Handle MK/L string syntax: --str-> "content"
     if (match(args, /--str-> *".*"$/)) {
-        match(args, /".*"/)
-        output = substr(args, RSTART + 1, RLENGTH - 2)
-        print output
+        if (match(args, /"[^"]*"/)) {
+            output = substr(args, RSTART + 1, RLENGTH - 2)
+            print output
+        }
         return 1
     }
     
     # Handle variable
     var_name = toupper(args)
+    gsub(/[ \t]/, "", var_name)
     if (var_name in variables) {
         print variables[var_name]
     } else {
@@ -207,11 +227,12 @@ function exec_set(args) {
     gsub(/^[ \t]+/, "", args)
     
     # Parse: variable TO value
-    if (match(toupper(args), /^([A-Z][A-Z0-9]*) +TO +(.+)$/)) {
-        var_name = toupper(substr(args, 1, index(toupper(args), " TO ") - 1))
+    if (match(toupper(args), / TO /)) {
+        to_pos = index(toupper(args), " TO ")
+        var_name = toupper(substr(args, 1, to_pos - 1))
         gsub(/[ \t]+/, "", var_name)
         
-        value_part = substr(args, index(toupper(args), " TO ") + 4)
+        value_part = substr(args, to_pos + 4)
         gsub(/^[ \t]+/, "", value_part)
         
         value = evaluate_expression(value_part)
@@ -227,7 +248,7 @@ function exec_let(args) {
     gsub(/^[ \t]+/, "", args)
     
     # Parse: variable = expression
-    if (match(args, /^[A-Za-z][A-Za-z0-9]* *= */)) {
+    if (match(args, /=/)) {
         equals_pos = index(args, "=")
         var_name = toupper(substr(args, 1, equals_pos - 1))
         gsub(/[ \t]+/, "", var_name)
@@ -249,15 +270,15 @@ function exec_if(args) {
     
     # Simple IF condition THEN action (or $$ for MK/L)
     then_pos = index(toupper(args), " THEN ")
+    then_len = 6
+    
     if (then_pos == 0) {
         then_pos = index(args, " $$ ")
+        then_len = 4
         if (then_pos == 0) {
             print "Syntax error: IF without THEN or $$"
             return 1
         }
-        then_len = 4
-    } else {
-        then_len = 6
     }
     
     condition = substr(args, 1, then_pos - 1)
@@ -273,46 +294,52 @@ function exec_if(args) {
 function exec_input(stmt) {
     # Handle both IN and INPUT
     if (match(toupper(stmt), /^IN[ \t]/)) {
-        args = substr(stmt, 3)
+        args = substr(stmt, 4)
     } else {
-        args = substr(stmt, 6)
+        args = substr(stmt, 7)
     }
     
     gsub(/^[ \t]+/, "", args)
     
     # Parse: variable = IN "prompt" or LET variable = INPUT "prompt"
-    if (match(toupper(args), /^LET +([A-Z][A-Z0-9]*) *= *IN +/) || 
-        match(toupper(args), /^([A-Z][A-Z0-9]*) *= */) ||
-        match(args, /^LET +([A-Za-z][A-Za-z0-9]*) *= *INPUT +/)) {
+    var_name = ""
+    prompt = ""
+    
+    if (match(toupper(args), /^LET +[A-Z][A-Z0-9]* *= */)) {
+        # LET var = INPUT "prompt"
+        equals_pos = index(args, "=")
+        var_part = substr(args, 5, equals_pos - 5)
+        gsub(/[ \t]+/, "", var_part)
+        var_name = toupper(var_part)
         
-        # Extract variable name
-        if (match(args, /LET +([A-Za-z][A-Za-z0-9]*)/)) {
-            var_name = toupper(substr(args, RSTART + 4, RLENGTH - 4))
-        } else if (match(args, /^([A-Za-z][A-Za-z0-9]*)/)) {
-            var_name = toupper(substr(args, RSTART, RLENGTH))
+        prompt_part = substr(args, equals_pos + 1)
+        gsub(/^[ \t]+/, "", prompt_part)
+        if (match(prompt_part, /^(IN|INPUT) +/)) {
+            prompt_part = substr(prompt_part, RLENGTH + 1)
+            gsub(/^[ \t]+/, "", prompt_part)
         }
-        
-        # Extract prompt if any
-        prompt = ""
-        if (match(args, /"[^"]*"/)) {
-            prompt = substr(args, RSTART + 1, RLENGTH - 2)
+        if (match(prompt_part, /"[^"]*"/)) {
+            prompt = substr(prompt_part, RSTART + 1, RLENGTH - 2)
         }
-        
-        if (prompt != "") printf "%s", prompt
-        
-        if ((getline input_value) > 0) {
-            # Try to convert to number if possible
-            if (input_value ~ /^-?[0-9]+(\.[0-9]+)?$/) {
-                variables[var_name] = input_value + 0
-            } else {
-                variables[var_name] = input_value
-            }
-        }
-        
+    }
+    
+    if (var_name == "") {
+        print "Syntax error in INPUT statement"
         return 1
     }
     
-    print "Syntax error in INPUT statement"
+    if (prompt != "") printf "%s", prompt
+    fflush()
+    
+    if ((getline input_value < "/dev/stdin") > 0) {
+        # Try to convert to number if possible
+        if (input_value ~ /^-?[0-9]+(\.[0-9]+)?$/) {
+            variables[var_name] = input_value + 0
+        } else {
+            variables[var_name] = input_value
+        }
+    }
+    
     return 1
 }
 
@@ -341,18 +368,28 @@ function evaluate_expression(expr) {
 function evaluate_condition(cond) {
     gsub(/^[ \t]+|[ \t]+$/, "", cond)
     
-    # Handle various comparison operators
-    operators[1] = " ?+ "  # MK/L greater than
-    operators[2] = " > "
-    operators[3] = " < "
-    operators[4] = " >= "
-    operators[5] = " <= "
-    operators[6] = " = "
-    operators[7] = " == "
-    operators[8] = " <> "
-    operators[9] = " != "
+    # Handle MK/L ?+ operator first
+    if (match(cond, / \?\+ /)) {
+        op_pos = index(cond, " ?+ ")
+        left = substr(cond, 1, op_pos - 1)
+        right = substr(cond, op_pos + 4)
+        
+        left_val = evaluate_expression(left)
+        right_val = evaluate_expression(right)
+        return left_val > right_val
+    }
     
-    for (i = 1; i <= 9; i++) {
+    # Handle other operators
+    operators[1] = " > "
+    operators[2] = " < "
+    operators[3] = " >= "
+    operators[4] = " <= "
+    operators[5] = " = "
+    operators[6] = " == "
+    operators[7] = " <> "
+    operators[8] = " != "
+    
+    for (i = 1; i <= 8; i++) {
         op = operators[i]
         pos = index(cond, op)
         if (pos > 0) {
@@ -362,7 +399,7 @@ function evaluate_condition(cond) {
             left_val = evaluate_expression(left)
             right_val = evaluate_expression(right)
             
-            if (op == " ?+ " || op == " > ") return left_val > right_val
+            if (op == " > ") return left_val > right_val
             if (op == " < ") return left_val < right_val
             if (op == " >= ") return left_val >= right_val
             if (op == " <= ") return left_val <= right_val
